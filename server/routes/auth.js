@@ -1,25 +1,13 @@
-/**
- * server/routes/auth.js
- * - POST /api/auth/signup           { email, password, phone, referral }
- * - GET  /api/auth/verify/:token
- * - POST /api/auth/resend          { email }
- * - POST /api/auth/login           { email, password }
- * - POST /api/auth/logout
- * - GET  /api/auth/me
- *
- * Uses cookies for auth token (httpOnly cookie pb_token)
- */
-
+// server/routes/auth.js
 import express from "express";
-import crypto from "crypto";
+import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-import bcrypt from "bcryptjs";
 import nodemailer from "nodemailer";
-import { db } from "../db.js";
+import { getDb } from "../db.js";
 
 const router = express.Router();
 
-// nodemailer with Gmail SMTP - requires EMAIL_USER and EMAIL_PASS
+// setup Gmail SMTP transporter
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
@@ -28,138 +16,83 @@ const transporter = nodemailer.createTransport({
   }
 });
 
-function signToken(userId) {
-  const secret = process.env.JWT_SECRET || "please-set-a-secret";
-  return jwt.sign({ uid: userId }, secret, { expiresIn: "7d" });
-}
-
-function setAuthCookie(res, token) {
-  // in production set secure:true and sameSite accordingly
-  res.cookie("pb_token", token, { httpOnly: true, sameSite: "lax", secure: false, path: "/" });
-}
-
-async function sendVerificationEmail(email, token) {
-  const base = process.env.BASE_URL || `http://localhost:${process.env.PORT || 8080}`;
-  const link = `${base}/api/auth/verify/${token}`;
-  const html = `
-    <div>
-      <h3>Welcome to Profit Bliss</h3>
-      <p>Click to verify your email:</p>
-      <a href="${link}">${link}</a>
-      <p>If you did not sign up, ignore this message.</p>
-    </div>`;
-  await transporter.sendMail({ from: process.env.EMAIL_USER, to: email, subject: "Verify your Profit Bliss account", html });
-}
-
-// SIGNUP
+// signup
 router.post("/signup", async (req, res) => {
+  const { name, email, phone, password, referral } = req.body;
+  const db = getDb();
+
   try {
-    const { email, password, phone, referral } = req.body || {};
-    if (!email || !password) return res.status(400).send("Email and password required");
-    // referral validation: allow blank or exact code tmdf28dns
-    if (referral && referral !== "tmdf28dns") return res.status(400).send("Invalid referral code");
+    if (referral && referral !== "tmdf28dns") {
+      return res.status(400).json({ error: "Invalid referral code" });
+    }
 
-    const exists = await db.get("SELECT id FROM users WHERE email = ?", email.toLowerCase());
-    if (exists) return res.status(400).send("Email already registered");
+    const hashed = await bcrypt.hash(password, 10);
+    const result = await db.run(
+      `INSERT INTO users (name, email, phone, password, referral) VALUES (?,?,?,?,?)`,
+      [name, email, phone, hashed, referral || ""]
+    );
 
-    const hash = bcrypt.hashSync(password, 10);
-    const result = await db.run("INSERT INTO users (email, password, phone, referral, verified) VALUES (?, ?, ?, ?, 0)",
-      email.toLowerCase(), hash, phone || null, referral || null);
     const userId = result.lastID;
+    const token = jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: "1d" });
 
-    // create verify token
-    const token = crypto.randomBytes(20).toString("hex");
-    await db.run("INSERT INTO verify_tokens (user_id, token) VALUES (?, ?)", userId, token);
+    // send verification email
+    const verifyLink = `${process.env.BASE_URL}/api/auth/verify/${token}`;
+    await transporter.sendMail({
+      from: `"Profit Bliss" <${process.env.EMAIL_USER}>`,
+      to: email,
+      subject: "Verify your Profit Bliss account",
+      html: `<p>Hello ${name},</p>
+             <p>Click the link below to verify your account:</p>
+             <a href="${verifyLink}">${verifyLink}</a>`
+    });
 
-    // send verification email (async)
-    try { await sendVerificationEmail(email, token); } catch (e) { console.error("Email send failed", e); }
-
-    return res.json({ ok: true, message: "Signup successful. Check your email for verification link." });
+    res.json({ message: "Signup successful, please check your email to verify" });
   } catch (err) {
     console.error(err);
-    res.status(500).send("Server error");
+    res.status(400).json({ error: "Email already exists or DB error" });
   }
 });
 
-// VERIFY
+// verify email
 router.get("/verify/:token", async (req, res) => {
   try {
-    const token = req.params.token;
-    const row = await db.get("SELECT * FROM verify_tokens WHERE token = ?", token);
-    if (!row) return res.status(400).send("Invalid or expired token");
-    await db.run("UPDATE users SET verified = 1 WHERE id = ?", row.user_id);
-    await db.run("DELETE FROM verify_tokens WHERE id = ?", row.id);
-    return res.send("Email verified! You can now log in.");
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Server error");
+    const decoded = jwt.verify(req.params.token, process.env.JWT_SECRET);
+    const db = getDb();
+    await db.run(`UPDATE users SET verified = 1 WHERE id = ?`, [decoded.id]);
+    res.send("✅ Email verified. You can now log in.");
+  } catch {
+    res.status(400).send("Invalid or expired verification link");
   }
 });
 
-// RESEND verification
-router.post("/resend", async (req, res) => {
-  try {
-    const { email } = req.body || {};
-    if (!email) return res.status(400).send("Email required");
-    const user = await db.get("SELECT id, verified FROM users WHERE email = ?", email.toLowerCase());
-    if (!user) return res.status(404).send("User not found");
-    if (user.verified) return res.status(400).send("Already verified");
-
-    const token = crypto.randomBytes(20).toString("hex");
-    await db.run("INSERT INTO verify_tokens (user_id, token) VALUES (?, ?)", user.id, token);
-    try { await sendVerificationEmail(email, token); } catch (e) { console.error("Email send failed", e); }
-
-    return res.json({ ok: true, message: "Verification email resent" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Server error");
-  }
-});
-
-// LOGIN
+// login
 router.post("/login", async (req, res) => {
-  try {
-    const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).send("Email and password required");
-    const user = await db.get("SELECT * FROM users WHERE email = ?", email.toLowerCase());
-    if (!user) return res.status(400).send("Invalid email or password");
-    if (!user.verified) return res.status(401).send("Email not verified");
-    const ok = bcrypt.compareSync(password, user.password);
-    if (!ok) return res.status(400).send("Invalid email or password");
+  const { email, password } = req.body;
+  const db = getDb();
 
-    const token = signToken(user.id);
-    setAuthCookie(res, token);
+  const user = await db.get(`SELECT * FROM users WHERE email = ?`, [email]);
+  if (!user) return res.status(400).json({ error: "Invalid credentials" });
 
-    // return safe user object
-    const safe = { id: user.id, email: user.email, phone: user.phone, balance: user.balance, isAdmin: !!user.is_admin };
-    return res.json(safe);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Server error");
+  const match = await bcrypt.compare(password, user.password);
+  if (!match) return res.status(400).json({ error: "Invalid credentials" });
+
+  if (!user.verified) {
+    return res.status(400).json({ error: "Please verify your email first" });
   }
-});
 
-// LOGOUT
-router.post("/logout", (_req, res) => {
-  res.clearCookie("pb_token");
-  res.json({ ok: true });
-});
+  const token = jwt.sign({ id: user.id }, process.env.JWT_SECRET, { expiresIn: "7d" });
 
-// ME
-router.get("/me", async (req, res) => {
-  try {
-    const token = req.cookies && req.cookies.pb_token;
-    if (!token) return res.status(401).send("Unauthorized");
-    const secret = process.env.JWT_SECRET || "please-set-a-secret";
-    let data;
-    try { data = jwt.verify(token, secret); } catch { return res.status(401).send("Unauthorized"); }
-    const user = await db.get("SELECT id, email, phone, balance, is_admin FROM users WHERE id = ?", data.uid);
-    if (!user) return res.status(401).send("Unauthorized");
-    res.json({ id: user.id, email: user.email, phone: user.phone, balance: user.balance, isAdmin: !!user.is_admin });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Server error");
-  }
+  res.json({
+    message: "Login successful",
+    token,
+    user: {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      phone: user.phone,
+      balance: user.balance
+    }
+  });
 });
 
 export default router;
