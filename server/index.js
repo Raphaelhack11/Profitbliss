@@ -1,46 +1,34 @@
-/**
- * server/index.js
- * Entrypoint for Profit Bliss backend (simple Express + SQLite + email verification)
- *
- * Env vars required:
- *  - PORT (optional, default 8080)
- *  - JWT_SECRET (a long random string)
- *  - EMAIL_USER (Gmail address for sending verification emails)
- *  - EMAIL_PASS (Gmail App Password)
- *  - BASE_URL (public URL of backend, e.g. https://profitbliss-backend.onrender.com)
- *
- * Note: on Render set EMAIL_USER and EMAIL_PASS (app password). Use HTTPS in production.
- */
-
 import express from "express";
 import cors from "cors";
-import cookieParser from "cookie-parser";
-import { initDb } from "./db.js";
-import authRoutes from "./routes/auth.js";
+import bodyParser from "body-parser";
+
+import plansRoutes from "./plans.js";
+import transactionsRoutes from "./transactions.js";
+import messagesRoutes from "./messages.js";
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 5000;
 
-app.use(cors({
-  origin: true,
-  credentials: true
-}));
-app.use(express.json());
-app.use(cookieParser());
+// Middleware
+app.use(cors());
+app.use(bodyParser.json());
 
-// initialize sqlite DB (creates tables if missing)
-await initDb();
+// Health check
+app.get("/", (req, res) => {
+  res.send("🚀 ProfitBliss API running...");
+});
 
-app.get("/api/health", (_req, res) => res.json({ ok: true }));
+// Routes
+app.use("/api/plans", plansRoutes);
+app.use("/api/transactions", transactionsRoutes);
+app.use("/api/messages", messagesRoutes);
 
-// mount auth routes at /api/auth
-app.use("/api/auth", authRoutes);
+// Catch-all for invalid routes
+app.use((req, res) => {
+  res.status(404).json({ error: "Route not found" });
+});
 
-// simple index route
-app.get("/", (_req, res) => res.send("Profit Bliss backend running"));
-
-// start
+// Start server
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-  console.log("Make sure env vars JWT_SECRET, EMAIL_USER and EMAIL_PASS are set.");
+  console.log(`✅ Server running on http://localhost:${PORT}`);
 });
